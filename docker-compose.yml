@@ -1,0 +1,74 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: store_intel_db
+    environment:
+      POSTGRES_USER: store_user
+      POSTGRES_PASSWORD: store_secure_pass_2026
+      POSTGRES_DB: store_intelligence
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U store_user -d store_intelligence"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: store_intel_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: ./api
+    container_name: store_intel_api
+    environment:
+      - PORT=3000
+      - DB_HOST=db
+      - DB_USER=store_user
+      - DB_PASSWORD=store_secure_pass_2026
+      - DB_NAME=store_intelligence
+      - REDIS_URL=redis://redis:6379
+      - NODE_ENV=production
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  pipeline:
+    build: ./pipeline
+    container_name: store_intel_pipeline
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - CCTV_DIR=/app/cctv_footage
+    volumes:
+      - ./CCTV Footage:/app/cctv_footage:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  dashboard:
+    build: ./dashboard
+    container_name: store_intel_dashboard
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:

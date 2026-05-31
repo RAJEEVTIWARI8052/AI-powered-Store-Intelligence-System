@@ -1,0 +1,11 @@
+node_modules/
+CCTV Footage/
+CCTV Footage-*.zip
+.DS_Store
+*.log
+extracted_images/
+tmp/
+dist/
+build/
+.env
+.gemini/
