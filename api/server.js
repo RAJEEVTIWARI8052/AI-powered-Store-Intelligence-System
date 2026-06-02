@@ -1,13 +1,65 @@
 const express = require('express');
-const http = require('http');
+const http    = require('http');
 const WebSocket = require('ws');
-const redis = require('redis');
-const crypto = require('crypto');
-const db = require('./db');
-const routes = require('./routes');
+const redis   = require('redis');
+const crypto  = require('crypto');
+const db      = require('./db');
+const routes  = require('./routes');
+const logger  = require('./logger');
+
+// ---------------------------------------------------------------------------
+// Prometheus metrics setup
+// ---------------------------------------------------------------------------
+let promClient, httpRequestCounter, httpRequestDuration, eventsProcessed, anomaliesTriggered;
+try {
+  promClient = require('prom-client');
+  promClient.collectDefaultMetrics({ prefix: 'store_api_' });
+
+  httpRequestCounter = new promClient.Counter({
+    name: 'store_api_http_requests_total',
+    help: 'Total HTTP requests',
+    labelNames: ['method', 'route', 'status'],
+  });
+
+  httpRequestDuration = new promClient.Histogram({
+    name: 'store_api_http_request_duration_seconds',
+    help: 'HTTP request latency',
+    labelNames: ['method', 'route'],
+    buckets: [0.01, 0.05, 0.1, 0.5, 1.0, 2.0],
+  });
+
+  eventsProcessed = new promClient.Counter({
+    name: 'store_api_events_processed_total',
+    help: 'Total pipeline events processed',
+    labelNames: ['event_type'],
+  });
+
+  anomaliesTriggered = new promClient.Counter({
+    name: 'store_api_anomalies_total',
+    help: 'Total anomalies detected',
+    labelNames: ['anomaly_type', 'severity'],
+  });
+
+  logger.info('Prometheus metrics initialised');
+} catch (e) {
+  logger.warn('prom-client not available — metrics endpoint disabled', { error: e.message });
+}
 
 const app = express();
 app.use(express.json());
+
+// HTTP request logging middleware
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const ms = Date.now() - start;
+    const route = req.path.replace(/\/[0-9a-f-]{36}/gi, '/:id');
+    logger.http(`${req.method} ${req.path}`, { status: res.statusCode, ms });
+    if (httpRequestCounter)  httpRequestCounter.inc({ method: req.method, route, status: res.statusCode });
+    if (httpRequestDuration) httpRequestDuration.observe({ method: req.method, route }, ms / 1000);
+  });
+  next();
+});
 
 // Enable CORS
 app.use((req, res, next) => {
@@ -20,6 +72,23 @@ app.use((req, res, next) => {
 app.use('/api', routes);
 app.use('/', routes); // Support root-level calls like /metrics and /Metrics
 
+// Prometheus metrics endpoint
+app.get('/api/system/metrics', async (req, res) => {
+  if (!promClient) return res.status(503).json({ error: 'Metrics not available' });
+  res.set('Content-Type', promClient.register.contentType);
+  res.end(await promClient.register.metrics());
+});
+
+// Health-check endpoint
+app.get('/api/health', async (req, res) => {
+  try {
+    await db.query('SELECT 1');
+    res.json({ status: 'ok', db: 'connected', timestamp: new Date().toISOString() });
+  } catch (e) {
+    res.status(503).json({ status: 'degraded', db: 'disconnected', error: e.message });
+  }
+});
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
@@ -27,11 +96,11 @@ const wss = new WebSocket.Server({ server });
 const clients = new Set();
 wss.on('connection', (ws) => {
   clients.add(ws);
-  console.log(`WebSocket client connected. Total clients: ${clients.size}`);
-  
+  logger.info('WebSocket client connected', { total: clients.size });
+
   ws.on('close', () => {
     clients.delete(ws);
-    console.log(`WebSocket client disconnected. Total clients: ${clients.size}`);
+    logger.info('WebSocket client disconnected', { total: clients.size });
   });
 });
 
@@ -44,34 +113,121 @@ function broadcast(data) {
   }
 }
 
-// Ingestion endpoint for pipeline
+// Ingestion endpoint for pipeline — accepts official Purplle JSONL schema
+// Supports: id_token (entry/exit), track_id (zone/queue), or legacy customer_id
 app.post('/api/ingest', async (req, res) => {
   const event = req.body;
-  if (!event || !event.event_type || !event.customer_id) {
-    return res.status(400).json({ error: "Invalid event format" });
+  if (!event || !event.event_type) {
+    return res.status(400).json({ error: "Invalid event: event_type is required" });
+  }
+  const hasId = event.customer_id || event.id_token || event.track_id;
+  if (!hasId) {
+    return res.status(400).json({ error: "Invalid event: one of customer_id, id_token, or track_id is required" });
   }
   try {
     await processEvent(event);
+    if (eventsProcessed) eventsProcessed.inc({ event_type: event.event_type });
     res.json({ success: true });
   } catch (err) {
-    console.error("Error processing ingested event:", err);
+    logger.error('Error processing ingested event', { error: err.message, event_type: event.event_type });
     res.status(500).json({ error: err.message });
   }
 });
 
 // Process event and update database
+// Normalises both the official Purplle JSONL schema and the legacy internal schema.
 async function processEvent(event) {
-  const id = crypto.randomUUID(); // always use a proper UUID for DB (pipeline IDs like evt_XXXX are not valid UUIDs)
-  const timestamp = event.timestamp || new Date().toISOString();
-  const camera_id = event.camera_id || 'CAM_UNKNOWN';
-  const type = event.event_type;
-  const customerId = event.customer_id;
-  const groupId = event.group_id || null;
-  const zone = event.zone || null;
-  const brand = event.brand || null;
-  const isStaff = event.is_staff || false;
-  const payload = event.payload || {};
+  const rawType = (event.event_type || '').trim();
 
+  // Map official schema event types → internal DB types
+  const typeMap = {
+    'entry':            'ENTRY',
+    'exit':             'EXIT',
+    'zone_entered':     'ZONE_ENTRY',
+    'zone_exited':      'ZONE_EXIT',
+    'queue_completed':  'CHECKOUT_COMPLETE',
+    'queue_abandoned':  'CHECKOUT_ABANDONED',
+    // Legacy internal types (already uppercase) pass through unchanged
+  };
+  let type = typeMap[rawType] || rawType.toUpperCase();
+
+  // Resolve customer identifier — official schema uses id_token (entry/exit)
+  // or track_id (zone/queue); legacy schema uses customer_id directly.
+  let customerId = event.customer_id;
+  if (!customerId && event.id_token) {
+    customerId = String(event.id_token);
+  } else if (!customerId && event.track_id !== undefined) {
+    customerId = `track_${event.track_id}`;
+  } else if (!customerId) {
+    customerId = 'cust_unknown';
+  }
+
+  const timestamp = event.event_timestamp || event.event_time || event.queue_join_ts || event.timestamp || new Date().toISOString();
+  const camera_id = event.camera_id || 'CAM_UNKNOWN';
+  const groupId   = event.group_id || null;
+
+  // Resolve zone — official schema uses zone_name, legacy uses zone
+  let zone = event.zone_name || event.zone || null;
+  if (type === 'CHECKOUT_COMPLETE' || type === 'CHECKOUT_ABANDONED') {
+    zone = zone || 'Cash Counter';
+  }
+
+  let brand = event.brand || null;
+  if (!brand && zone) {
+    // Dynamically associate shelf layout areas to brands to keep analytics functioning
+    const zoneBrands = {
+      'Makeup': ["Maybelline", "Lakme", "Faces Canada", "Swiss Beauty"],
+      'Skincare': ["Minimalist", "Neutrogena", "Aqualogica", "COSRX", "Foxtale"],
+      'Haircare': ["Bare Anatomy", "Garnier", "Pilgrim", "Good Vibes"],
+      'Left Shelf': ["Maybelline", "Lakme"],
+      'Lipstick Aisle': ["Faces Canada", "Swiss Beauty"],
+      'Center Display': ["Minimalist", "Aqualogica"],
+      'Billing Counter Queue': ["Purplle"]
+    };
+    const brands = zoneBrands[zone] || ["Unknown"];
+    const idNum = parseInt(customerId.replace(/\D/g, '') || '0', 10) || 1;
+    brand = brands[idNum % brands.length];
+  }
+
+  const isStaff = event.is_staff || false;
+  let payload = event.payload || {};
+  if (typeof payload === 'string') {
+    try { payload = JSON.parse(payload); } catch(e) { payload = {}; }
+  }
+
+  // Calculate dwell_seconds if zone_exited occurs and it is not in the payload
+  if (!payload.dwell_seconds && type === 'ZONE_EXIT') {
+    try {
+      const enterRes = await db.query(
+        "SELECT timestamp FROM events WHERE customer_id = $1 AND event_type = 'ZONE_ENTRY' AND zone = $2 ORDER BY timestamp DESC LIMIT 1",
+        [customerId, zone]
+      );
+      if (enterRes.rows.length > 0) {
+        const enterTime = new Date(enterRes.rows[0].timestamp);
+        const exitTime = new Date(timestamp);
+        payload.dwell_seconds = Math.max(1, Math.round((exitTime - enterTime) / 1000));
+      } else {
+        payload.dwell_seconds = 30; // fallback standard
+      }
+    } catch(err) {
+      payload.dwell_seconds = 30;
+    }
+  }
+
+  if (type === 'CHECKOUT_COMPLETE') {
+    if (event.wait_seconds !== undefined) {
+      payload.dwell_seconds = parseInt(event.wait_seconds, 10);
+    } else if (event.queue_exit_ts && event.queue_join_ts) {
+      const enterTime = new Date(event.queue_join_ts);
+      const exitTime = new Date(event.queue_exit_ts);
+      payload.dwell_seconds = Math.max(1, Math.round((exitTime - enterTime) / 1000));
+    }
+    payload.purchase_completed = !(event.abandoned || false);
+    payload.salesperson = event.salesperson || "Zufishan Khazra";
+  }
+
+  const id = crypto.randomUUID(); // always use a proper UUID for DB
+  
   // 1. Insert into events table
   await db.query(`
     INSERT INTO events (id, timestamp, camera_id, event_type, customer_id, group_id, zone, brand, is_staff, raw_payload)
@@ -169,28 +325,25 @@ async function logAnomaly(timestamp, type, description, severity, customerId = n
       VALUES ($1, $2, $3, $4, $5)
       RETURNING *
     `, [timestamp, type, description, severity, customerId]);
-    
-    // Broadcast anomaly instantly
-    broadcast({
-      event_type: 'ANOMALY_DETECTED',
-      anomaly: res.rows[0]
-    });
-    console.log(`[ANOMALY ALERT] ${type}: ${description}`);
+
+    broadcast({ event_type: 'ANOMALY_DETECTED', anomaly: res.rows[0] });
+    if (anomaliesTriggered) anomaliesTriggered.inc({ anomaly_type: type, severity });
+    logger.warn('Anomaly detected', { type, severity, customer_id: customerId, description });
   } catch (err) {
-    console.error("Error inserting anomaly record:", err);
+    logger.error('Error inserting anomaly record', { error: err.message });
   }
 }
 
 // Connect to Redis and subscribe to events
 async function startRedisSubscription() {
   const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
-  console.log(`Connecting to Redis at: ${redisUrl}`);
+  logger.info(`Connecting to Redis`, { url: redisUrl });
   const client = redis.createClient({ url: redisUrl });
-  
-  client.on('error', (err) => console.error('Redis Client Error:', err));
-  
+
+  client.on('error', (err) => logger.error('Redis Client Error', { error: err.message }));
+
   await client.connect();
-  console.log("Connected to Redis successfully.");
+  logger.info('Connected to Redis successfully');
 
   const subscriber = client.duplicate();
   await subscriber.connect();
@@ -199,30 +352,28 @@ async function startRedisSubscription() {
     try {
       const event = JSON.parse(message);
       await processEvent(event);
+      if (eventsProcessed) eventsProcessed.inc({ event_type: event.event_type || 'unknown' });
     } catch (e) {
-      console.error("Error processing Redis subscribed message:", e);
+      logger.error('Error processing Redis event', { error: e.message });
     }
   });
 
-  console.log("Subscribed to Redis channel 'store_events'.");
+  logger.info("Subscribed to Redis channel 'store_events'");
 }
 
 async function start() {
   const port = process.env.PORT || 3000;
   try {
-    // Wait for database to initialize tables
     await db.initDB();
-    
-    // Start Redis client subscription
     await startRedisSubscription().catch(e => {
-      console.warn("Could not start Redis subscription (fallback to HTTP ingestion):", e.message);
+      logger.warn('Could not start Redis subscription (fallback to HTTP ingestion)', { error: e.message });
     });
 
     server.listen(port, () => {
-      console.log(`Store Intelligence API Server is running on port ${port}`);
+      logger.info(`Store Intelligence API running`, { port, env: process.env.NODE_ENV || 'development' });
     });
   } catch (err) {
-    console.error("Failed to start server:", err);
+    logger.error('Fatal: failed to start server', { error: err.message });
     process.exit(1);
   }
 }

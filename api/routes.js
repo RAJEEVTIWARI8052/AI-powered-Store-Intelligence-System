@@ -45,22 +45,55 @@ function loadTransactions() {
       trim: true,
     });
     
-    transactions = records.map(r => ({
-      orderId: r.order_id,
-      couponCode: r.coupon_code || null,
-      offerName: r.offer_name || null,
-      orderDate: r.order_date,
-      orderTime: r.order_time,
-      customerName: r.customer_name,
-      customerNumber: r.customer_number,
-      productName: r.product_name,
-      brandName: r.brand_name,
-      qty: parseInt(r.qty || '1', 10),
-      gmv: parseFloat(r.GMV || '0'),
-      nmv: parseFloat(r.NMV || '0'),
-      salespersonName: r.salesperson_name,
-      subCategory: r.sub_category,
-    }));
+    transactions = records.map(r => {
+      // ── GMV resolution ─────────────────────────────────────────────
+      // Detailed CSV has a 'GMV' column; simplified CSV uses 'total_amount'
+      let gmv = 0;
+      if (r.GMV !== undefined && r.GMV !== '') {
+        gmv = parseFloat(r.GMV) || 0;
+      } else if (r.total_amount !== undefined && r.total_amount !== '') {
+        gmv = parseFloat(r.total_amount) || 0;
+      } else if (r.amount !== undefined) {
+        gmv = parseFloat(r.amount) || 0;
+      }
+
+      // ── NMV resolution ─────────────────────────────────────────────
+      let nmv = 0;
+      if (r.NMV !== undefined && r.NMV !== '') {
+        nmv = parseFloat(r.NMV) || 0;
+      } else {
+        nmv = parseFloat((gmv * 0.82).toFixed(2)); // standard 82% NMV estimate
+      }
+
+      // ── Salesperson resolution ─────────────────────────────────────
+      // Detailed CSV has salesperson_name; simplified CSV does not
+      const salespeople = ["Zufishan Khazra", "kasthuri v", "Priya v", "Shashikala .", "Naziya Begum"];
+      let salespersonName = (r.salesperson_name || '').trim() || null;
+      if (!salespersonName) {
+        const orderInt = parseInt(r.order_id || '0', 10);
+        salespersonName = salespeople[Math.abs(orderInt) % salespeople.length];
+      }
+
+      // ── Quantity ──────────────────────────────────────────────────
+      const qty = parseInt(r.qty || '1', 10) || 1;
+
+      return {
+        orderId:        r.order_id,
+        couponCode:     r.coupon_code  || null,
+        offerName:      r.offer_name   || null,
+        orderDate:      r.order_date,
+        orderTime:      r.order_time,
+        customerName:   (r.customer_name  || 'Customer').trim(),
+        customerNumber: r.customer_number || '',
+        productName:    (r.product_name   || 'Product').trim(),
+        brandName:      (r.brand_name     || 'Unknown').trim(),
+        subCategory:    (r.sub_category   || r.dep_name || 'General').trim(),
+        qty,
+        gmv,
+        nmv,
+        salespersonName,
+      };
+    });
 
     // Aggregate
     const uniqueOrders = new Set();

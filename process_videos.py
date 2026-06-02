@@ -1,12 +1,34 @@
 #!/usr/bin/env python3
 """
-CCTV Video Processor - Runs on Mac, pushes events to Redis (localhost:6379)
-Processes all 5 CAM videos using YOLOv8 person detection + tracking
+process_videos.py — Local CCTV Processor (runs on Mac, no Docker required)
+
+Processes all MP4 video files in ./CCTV Footage (or any path given as the first
+argument) using YOLOv8 person detection and the StoreTracker state machine.
+
+Events are pushed to:
+  1. Redis on localhost:6379 (if running `docker compose up`)
+  2. API on localhost:3000   (direct HTTP fallback)
+
+Usage:
+    python3 process_videos.py [VIDEO_DIR]
+
+Where VIDEO_DIR defaults to "./CCTV Footage".
+
+Supports dynamic camera naming from Store 1 and Store 2 zip archives:
+  • "CAM 3 - entry.mp4"   → entry_exit
+  • "CAM 5 - billing.mp4" → checkout
+  • "billing_area.mp4"    → checkout
+  • "entry 1.mp4"         → entry_exit
+  • "zone.mp4"            → zone (Skincare)
+  • "CAM 2 - zone.mp4"    → zone (Makeup)
 """
+
 import os
+import sys
 import cv2
 import json
 import time
+import uuid
 import redis
 import random
 import datetime
@@ -17,55 +39,53 @@ try:
     YOLO_AVAILABLE = True
 except ImportError:
     YOLO_AVAILABLE = False
-    print("WARNING: ultralytics not installed, using motion detection fallback")
+    print("⚠️  ultralytics not installed — using motion-detection fallback")
 
-# ─── Config ───────────────────────────────────────────────────────────────────
-CCTV_DIR   = "./CCTV Footage"
+# Import our tracker (adjust path when running from the workspace root)
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_pipeline_dir = os.path.join(_script_dir, "pipeline")
+if _pipeline_dir not in sys.path:
+    sys.path.insert(0, _pipeline_dir)
+
+from tracker import StoreTracker, classify_camera, STORE_CODE, _pick_demographics
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+CCTV_DIR   = sys.argv[1] if len(sys.argv) > 1 else os.path.join(_script_dir, "CCTV Footage")
 REDIS_URL  = "redis://localhost:6379"
 API_URL    = "http://localhost:3000/api/ingest"
-FRAME_SKIP = 30        # Process 1 frame per second (30fps videos)
-CONFIDENCE = 0.35      # Min detection confidence
+FRAME_SKIP = 30          # process 1 frame per second (30-fps footage)
+MIN_CONF   = 0.35        # YOLO confidence threshold
 
-# Camera → Zone mapping (based on store layout)
-CAM_ZONES = {
-    "CAM 1": {"zone": "Entry/Exit",   "type": "entry_exit",  "cam_id": "CAM 1"},
-    "CAM 2": {"zone": "Makeup",       "type": "zone",        "cam_id": "CAM 2"},
-    "CAM 3": {"zone": "Skincare",     "type": "zone",        "cam_id": "CAM 3"},
-    "CAM 4": {"zone": "Cash Counter", "type": "checkout",    "cam_id": "CAM 4"},
-    "CAM 5": {"zone": "Haircare",     "type": "zone",        "cam_id": "CAM 5"},
-}
-
-BRAND_ZONES = {
-    "Makeup":    ["Maybelline", "Lakme", "Faces Canada", "NY Bae", "Swiss Beauty"],
-    "Skincare":  ["Minimalist", "Neutrogena", "Aqualogica", "COSRX", "Foxtale"],
-    "Haircare":  ["Bare Anatomy", "Garnier", "Pilgrim", "Good Vibes"],
-}
-
-SALESPEOPLE = ["Zufishan Khazra", "kasthuri v", "Priya v", "Shashikala .", "Naziya Begum"]
-
-# ─── Redis Connection ──────────────────────────────────────────────────────────
-print(f"\n{'='*60}")
-print("  Purplle Store Intelligence - CCTV Video Processor")
-print(f"{'='*60}")
+# ---------------------------------------------------------------------------
+# Connections
+# ---------------------------------------------------------------------------
+print("\n" + "="*60)
+print("  Purplle Store Intelligence — CCTV Video Processor (Local)")
+print("="*60)
+print(f"  Video directory : {CCTV_DIR}")
 
 r = None
 try:
     r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
     r.ping()
-    print(f"✅ Connected to Redis at {REDIS_URL}")
+    print(f"✅ Redis connected at {REDIS_URL}")
 except Exception as e:
-    print(f"⚠️  Redis not available ({e}). Will use HTTP fallback to API.")
+    print(f"⚠️  Redis unavailable ({e}). Using HTTP fallback.")
 
-def crypto_id():
-    return str(random.randint(100000, 999999))
 
-def publish(event):
+def publish(event: dict):
+    """Publish event to Redis or fall back to direct API POST."""
+    event.setdefault("event_id",  f"evt_{uuid.uuid4().hex[:8]}")
+    event.setdefault("timestamp", datetime.datetime.now().isoformat())
+
     published = False
     if r:
         try:
             r.publish("store_events", json.dumps(event))
             published = True
-        except Exception as e:
+        except Exception:
             pass
     if not published:
         try:
@@ -73,105 +93,81 @@ def publish(event):
             published = True
         except Exception:
             pass
-    etype = event.get("event_type", "?")
-    cid   = event.get("customer_id", "?")
-    zone  = event.get("zone", "")
-    brand = event.get("brand", "")
-    extra = f" | Zone: {zone}" if zone else ""
-    extra += f" | Brand: {brand}" if brand else ""
+
+    etype  = event.get("event_type", "?")
+    cid    = event.get("customer_id") or event.get("id_token") or event.get("track_id", "?")
+    zone   = event.get("zone") or event.get("zone_name", "")
     status = "✅" if published else "❌"
-    print(f"  {status} [{etype:20s}] Customer: {cid}{extra}")
+    print(f"  {status} [{etype:<22s}] ID: {cid}  Zone: {zone}")
 
-# ─── YOLO Setup ───────────────────────────────────────────────────────────────
-model = None
-if YOLO_AVAILABLE:
-    print("\n📦 Loading YOLOv8n model (downloads ~6MB if not cached)...")
-    try:
-        model = YOLO("yolov8n.pt")
-        print("✅ YOLOv8n loaded successfully!")
-    except Exception as e:
-        print(f"⚠️  YOLO load failed: {e}. Using motion detection fallback.")
 
-# ─── Per-camera track state ───────────────────────────────────────────────────
-track_registry = {}  # track_id → {first_seen, cam, last_frame}
-
-def get_or_create_customer(track_id, cam_name):
-    key = f"{cam_name}_{track_id}"
-    if key not in track_registry:
-        track_registry[key] = {
-            "customer_id": f"cust_{crypto_id()}",
-            "first_seen":  time.time(),
-            "cam":         cam_name,
-        }
-    return track_registry[key]
-
-def detect_people_yolo(frame, cam_info):
-    """Run YOLOv8 person detection. Returns list of detected bounding boxes."""
-    results = model(frame, verbose=False, classes=[0])  # class 0 = person
-    detections = []
-    for r_item in results:
-        for box in r_item.boxes:
-            conf = float(box.conf[0])
-            if conf >= CONFIDENCE:
-                xyxy = box.xyxy[0].cpu().numpy().tolist()
-                detections.append({"bbox": xyxy, "conf": conf})
-    return detections
-
-def detect_people_motion(prev_gray, curr_gray):
-    """Fallback: motion detection when YOLO not available."""
-    diff  = cv2.absdiff(prev_gray, curr_gray)
+# ---------------------------------------------------------------------------
+# Motion-detection fallback (when YOLO is unavailable)
+# ---------------------------------------------------------------------------
+def detect_motion(prev_gray, curr_gray):
+    diff = cv2.absdiff(prev_gray, curr_gray)
     _, th = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
-    th    = cv2.dilate(th, None, iterations=2)
+    th = cv2.dilate(th, None, iterations=2)
     cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    detections = []
+    dets = []
     for c in cnts:
         if cv2.contourArea(c) > 1500:
             x, y, w, h = cv2.boundingRect(c)
-            detections.append({"bbox": [x, y, x+w, y+h], "conf": 0.6})
-    return detections
+            dets.append([x, y, x+w, y+h, 0.60])
+    return dets
 
-def get_appearance(frame, bbox):
-    """Sample dominant colour from upper body for re-identification hint."""
-    x1, y1, x2, y2 = [int(v) for v in bbox]
-    h = y2 - y1
-    crop = frame[y1:y1+h//2, x1:x2]
-    if crop.size == 0:
-        return {"upper": "unknown", "lower": "unknown"}
-    avg   = crop.mean(axis=(0, 1))           # BGR
-    b, g, rv = int(avg[0]), int(avg[1]), int(avg[2])
-    upper = "blue" if b > g and b > rv else ("red" if rv > g else "dark")
-    return {"upper": upper, "lower": random.choice(["black", "grey", "jeans"])}
 
-# ─── Process each video ───────────────────────────────────────────────────────
-video_files = sorted([f for f in os.listdir(CCTV_DIR) if f.lower().endswith(".mp4")])
-print(f"\n🎥 Found {len(video_files)} video files: {video_files}")
+# ---------------------------------------------------------------------------
+# Main processing loop
+# ---------------------------------------------------------------------------
+if not os.path.isdir(CCTV_DIR):
+    print(f"\n❌ Video directory not found: {CCTV_DIR}")
+    sys.exit(1)
+
+video_files = sorted(f for f in os.listdir(CCTV_DIR) if f.lower().endswith(".mp4"))
+print(f"\n🎥 Found {len(video_files)} video file(s): {video_files}\n")
+
+# Load YOLO model once
+model = None
+if YOLO_AVAILABLE:
+    model_path = os.path.join(_script_dir, "yolov8n.pt")
+    if not os.path.exists(model_path):
+        model_path = os.path.join(_pipeline_dir, "yolov8n.pt")
+    try:
+        print(f"📦 Loading YOLOv8n from: {model_path}")
+        model = YOLO(model_path)
+        print("✅ YOLOv8n loaded.\n")
+    except Exception as e:
+        print(f"⚠️  YOLO load failed: {e}. Using motion detection.")
+
+tracker = StoreTracker()
 
 for video_file in video_files:
-    cam_name = video_file.replace(".mp4", "").strip()
-    cam_info = CAM_ZONES.get(cam_name, {"zone": cam_name, "type": "zone", "cam_id": cam_name})
+    cam_info  = classify_camera(video_file)
+    camera_id = cam_info["cam_id"]
     video_path = os.path.join(CCTV_DIR, video_file)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        print(f"\n❌ Cannot open {video_path}")
+        print(f"\n❌ Cannot open: {video_path}")
         continue
 
-    fps        = cap.get(cv2.CAP_PROP_FPS) or 30
+    fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration_s = total_frames / fps
+    duration_s   = total_frames / fps
 
-    print(f"\n{'─'*60}")
-    print(f"📹 Processing: {video_file}")
-    print(f"   Camera  : {cam_name} → Zone: {cam_info['zone']}")
-    print(f"   FPS     : {fps:.1f}  |  Frames: {total_frames}  |  Duration: {duration_s:.0f}s")
-    print(f"   Sampling: every {FRAME_SKIP} frames (≈ 1 frame/sec)")
+    print(f"{'─'*60}")
+    print(f"📹 {video_file}")
+    print(f"   Type     : {cam_info['type']}")
+    print(f"   Zone     : {cam_info['zone']}")
+    print(f"   Camera   : {camera_id}")
+    print(f"   Duration : {duration_s:.0f}s  ({total_frames} frames @ {fps:.1f}fps)")
     print(f"{'─'*60}")
 
-    frame_idx    = 0
-    processed    = 0
-    people_seen  = 0
-    prev_gray    = None
-    active_in_cam = {}   # track_id → customer_id in this cam session
+    frame_idx = 0
+    processed = 0
+    prev_gray = None
+    start_ts  = datetime.datetime.now()
 
     while True:
         ret, frame = cap.read()
@@ -185,168 +181,48 @@ for video_file in video_files:
         curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         curr_gray = cv2.GaussianBlur(curr_gray, (21, 21), 0)
 
-        # ── Detect people ───────────────────────────────────────────────────
         if model:
-            detections = detect_people_yolo(frame, cam_info)
+            results    = model(frame, verbose=False, classes=[0])
+            detections = [
+                box.xyxy[0].cpu().numpy().tolist() + [float(box.conf[0])]
+                for box in results[0].boxes
+                if float(box.conf[0]) >= MIN_CONF
+            ]
         elif prev_gray is not None:
-            detections = detect_people_motion(prev_gray, curr_gray)
+            detections = detect_motion(prev_gray, curr_gray)
         else:
             detections = []
 
-        now = datetime.datetime.now().isoformat()
+        sim_ts = start_ts + datetime.timedelta(seconds=int(frame_idx / fps))
 
-        for i, det in enumerate(detections):
-            people_seen += 1
-            # Stable pseudo-ID within this camera session using position grid
-            bbox  = det["bbox"]
-            cx    = int((bbox[0] + bbox[2]) / 2)
-            cy    = int((bbox[1] + bbox[3]) / 2)
-            grid  = f"{cx//120}_{cy//120}"  # position grid cell
-            tid   = f"{cam_name}_{grid}"
+        events = tracker.update(detections, frame, camera_id, frame_idx, sim_ts, cam_info)
+        for evt in events:
+            evt.setdefault("event_id",  f"evt_{uuid.uuid4().hex[:8]}")
+            evt.setdefault("timestamp", sim_ts.isoformat())
+            publish(evt)
 
-            if tid not in active_in_cam:
-                cust_id = f"cust_{crypto_id()}"
-                active_in_cam[tid] = {
-                    "customer_id": cust_id,
-                    "first_frame": frame_idx,
-                    "last_frame":  frame_idx,
-                }
-                appearance = get_appearance(frame, bbox)
-                is_staff   = random.random() < 0.10
-
-                # ── ENTRY event (CAM 1) ──────────────────────────────────
-                if cam_info["type"] == "entry_exit":
-                    publish({
-                        "event_id":   f"evt_{crypto_id()}",
-                        "timestamp":  now,
-                        "camera_id":  cam_info["cam_id"],
-                        "event_type": "ENTRY",
-                        "customer_id": cust_id,
-                        "is_staff":   is_staff,
-                        "payload": {
-                            "confidence": det["conf"],
-                            "appearance": appearance,
-                            "frame":      frame_idx,
-                        }
-                    })
-
-                # ── ZONE_ENTRY event (CAM 2,3,5) ────────────────────────
-                elif cam_info["type"] == "zone":
-                    zone   = cam_info["zone"]
-                    brands = BRAND_ZONES.get(zone, ["Unknown"])
-                    brand  = random.choice(brands)
-                    publish({
-                        "event_id":   f"evt_{crypto_id()}",
-                        "timestamp":  now,
-                        "camera_id":  cam_info["cam_id"],
-                        "event_type": "ZONE_ENTRY",
-                        "customer_id": cust_id,
-                        "zone":       zone,
-                        "brand":      brand,
-                        "is_staff":   is_staff,
-                        "payload": {"confidence": det["conf"], "frame": frame_idx}
-                    })
-
-                # ── CHECKOUT_START event (CAM 4) ─────────────────────────
-                elif cam_info["type"] == "checkout":
-                    publish({
-                        "event_id":   f"evt_{crypto_id()}",
-                        "timestamp":  now,
-                        "camera_id":  cam_info["cam_id"],
-                        "event_type": "CHECKOUT_START",
-                        "customer_id": cust_id,
-                        "zone":       "Cash Counter",
-                        "is_staff":   is_staff,
-                        "payload": {"confidence": det["conf"], "frame": frame_idx}
-                    })
-
-            else:
-                # Already seen — update last frame
-                state = active_in_cam[tid]
-                state["last_frame"] = frame_idx
-                dwell = int((frame_idx - state["first_frame"]) / fps)
-                cust_id = state["customer_id"]
-
-                # ── INTERACTION event when dwell > 10s ──────────────────
-                if dwell > 10 and cam_info["type"] == "zone" and frame_idx % (FRAME_SKIP * 5) == 0:
-                    zone   = cam_info["zone"]
-                    brands = BRAND_ZONES.get(zone, ["Unknown"])
-                    brand  = random.choice(brands)
-                    publish({
-                        "event_id":   f"evt_{crypto_id()}",
-                        "timestamp":  now,
-                        "camera_id":  cam_info["cam_id"],
-                        "event_type": "INTERACTION",
-                        "customer_id": cust_id,
-                        "zone":       zone,
-                        "brand":      brand,
-                        "payload": {
-                            "action":        random.choice(["browse", "pick_up", "put_back"]),
-                            "dwell_seconds": dwell,
-                            "frame":         frame_idx,
-                        }
-                    })
-
-                # ── CHECKOUT_COMPLETE (CAM 4, dwell > 30s) ──────────────
-                elif dwell > 30 and cam_info["type"] == "checkout" and frame_idx % (FRAME_SKIP * 6) == 0:
-                    publish({
-                        "event_id":   f"evt_{crypto_id()}",
-                        "timestamp":  now,
-                        "camera_id":  cam_info["cam_id"],
-                        "event_type": "CHECKOUT_COMPLETE",
-                        "customer_id": cust_id,
-                        "zone":       "Cash Counter",
-                        "payload": {
-                            "dwell_seconds":      dwell,
-                            "salesperson":        random.choice(SALESPEOPLE),
-                            "purchase_completed": True,
-                            "frame":              frame_idx,
-                        }
-                    })
-
-        prev_gray = curr_gray
+        prev_gray  = curr_gray
         processed += 1
+        frame_idx += 1
 
-        # Progress indicator every 100 processed frames
         if processed % 100 == 0:
-            pct = (frame_idx / total_frames * 100) if total_frames else 0
-            print(f"  ⏳ Progress: {pct:.1f}% | Frame {frame_idx}/{total_frames} | People detected: {people_seen}")
+            pct = frame_idx / total_frames * 100 if total_frames else 0
+            print(f"  ⏳ {pct:.1f}% — frame {frame_idx}/{total_frames}")
 
-    # ── End of video — publish EXIT / ZONE_EXIT for all seen ────────────────
-    print(f"\n  📊 Wrapping up {cam_name} — publishing exit events for {len(active_in_cam)} tracked entities...")
-    for tid, state in active_in_cam.items():
-        cust_id = state["customer_id"]
-        dwell   = int((state["last_frame"] - state["first_frame"]) / fps)
-        now     = datetime.datetime.now().isoformat()
-
-        if cam_info["type"] == "entry_exit":
-            publish({
-                "event_id":   f"evt_{crypto_id()}",
-                "timestamp":  now,
-                "camera_id":  cam_info["cam_id"],
-                "event_type": "EXIT",
-                "customer_id": cust_id,
-                "payload": {"dwell_seconds": dwell}
-            })
-        elif cam_info["type"] == "zone":
-            zone   = cam_info["zone"]
-            brands = BRAND_ZONES.get(zone, ["Unknown"])
-            publish({
-                "event_id":   f"evt_{crypto_id()}",
-                "timestamp":  now,
-                "camera_id":  cam_info["cam_id"],
-                "event_type": "ZONE_EXIT",
-                "customer_id": cust_id,
-                "zone":       zone,
-                "brand":      random.choice(brands),
-                "payload": {"dwell_seconds": dwell}
-            })
+    # End of video — flush remaining tracks
+    sim_end = start_ts + datetime.timedelta(seconds=int(frame_idx / fps))
+    flush_events = tracker.clear_active_tracks(camera_id, sim_end, cam_info)
+    print(f"\n  📤 Flushing {len(flush_events)} remaining track(s) for {video_file}…")
+    for evt in flush_events:
+        evt.setdefault("event_id",  f"evt_{uuid.uuid4().hex[:8]}")
+        evt.setdefault("timestamp", sim_end.isoformat())
+        publish(evt)
 
     cap.release()
-    print(f"  ✅ {cam_name} done! Frames processed: {processed} | People events: {people_seen}")
+    print(f"  ✅ {video_file} complete. Frames processed: {processed}\n")
 
-print(f"\n{'='*60}")
-print("  🎉 All 5 CCTV videos processed successfully!")
-print(f"  📊 Check dashboard → http://localhost")
-print(f"  🔌 Check API       → http://localhost:3000/api/footfall")
-print(f"{'='*60}\n")
+print("="*60)
+print("  🎉 All videos processed!")
+print(f"  📊 Dashboard  → http://localhost")
+print(f"  🔌 API        → http://localhost:3000/api/metrics")
+print("="*60)

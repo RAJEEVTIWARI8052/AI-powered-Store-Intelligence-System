@@ -1,132 +1,220 @@
-# Store Intelligence System - Architecture & Design
+# AURA — Store Intelligence System: Architecture & Design
 
-AURA is an end-to-end Store Intelligence System designed to process retail security video streams, track consumer behaviors, calculate live conversion rates, and flag operational anomalies in real-time.
+AURA is a production-grade, end-to-end AI-powered Store Intelligence System built for Purplle. It ingests raw CCTV video footage, tracks customer movement using computer vision, correlates behaviour with POS transactions, and delivers real-time analytics via a live dashboard.
 
 ---
 
 ## 1. System Architecture
 
-The system consists of five decoupled services running in Docker container environments:
-
 ```
-[ CCTV Video Feeds ] 
-        │
-        ▼
-┌─────────────────────────────────┐
-│        Python Pipeline          │ (YOLOv8 Object Tracker & Uniform Detector)
-└────────────────┬────────────────┘
-                 │
-                 ▼ (Publish events)
-┌─────────────────────────────────┐
-│           Redis PubSub          │ (Event Broker)
-└────────────────┬────────────────┘
-                 │
-                 ▼ (Consume & Process)
-┌─────────────────────────────────┐
-│        Node.js REST API         │ (Express Server & Behavior Correlator)
-└────────┬───────────────┬────────┘
-         │               │
-         ▼ (Write)       ▼ (Correlate)
-┌────────────────┐     ┌────────────────┐
-│   PostgreSQL   │     │transactions.csv│ (POS Dataset)
-└────────────────┘     └────────────────┘
+  ┌──────────────────────────────────────────┐
+  │  CCTV Video Files (any naming convention) │
+  │  Store 1: CAM 3 - entry.mp4, etc.        │
+  │  Store 2: entry 1.mp4, billing_area.mp4  │
+  └────────────────────┬─────────────────────┘
+                       │
+                       ▼
+  ┌──────────────────────────────────────────┐
+  │         Python Detection Pipeline        │
+  │  YOLOv8-nano  ·  StoreTracker            │
+  │  Dynamic camera classifier               │
+  │  Emits: official Purplle JSONL schema    │
+  └────────────────────┬─────────────────────┘
+                       │  Redis Pub/Sub  (primary)
+                       │  HTTP POST      (fallback)
+                       ▼
+  ┌──────────────────────────────────────────┐
+  │        Node.js Express REST API          │
+  │  Schema normaliser · Session tracker     │
+  │  Anomaly engine  · POS correlator        │
+  └──────┬───────────────────────────────────┘
+         │  Write                │  Read
+         ▼                       ▼
+  ┌────────────┐     ┌──────────────────────┐
+  │ PostgreSQL │     │  transactions.csv    │
+  │ events     │     │  (Brigade Bangalore  │
+  │ sessions   │     │   detailed POS data) │
+  │ anomalies  │     └──────────────────────┘
+  │ brand_dwell│
+  └────────────┘
          ▲
-         │ (Websocket / HTTP GET)
-┌────────┴────────────────────────┐
-│    Vite + React Dashboard       │ (Live Analytics Monitor)
-└─────────────────────────────────┘
+         │  REST + WebSocket
+  ┌──────┴────────────────────────────────────┐
+  │   Vite + React Live Dashboard             │
+  │   Footfall · Funnel · Heatmap · Alerts    │
+  └───────────────────────────────────────────┘
 ```
 
-### Component Breakdown:
-1. **Detection & Tracking Pipeline**: A Python engine powered by OpenCV and YOLOv8-nano. It processes raw video files with active frame skipping, executes appearance profiling, and streams state-change events.
-2. **Event Broker**: Redis Pub/Sub streams detection events asynchronously to the API layer.
-3. **Backend API Service**: A Node.js Express server that ingests events, maps visitor sessions, stores them in PostgreSQL, and serves REST requests. It also implements in-memory anomaly detection and links video events with transaction logs.
-4. **Database (PostgreSQL)**: Stores system logs, aggregated customer sessions, dwell time registers, and anomaly logs.
-5. **Live Dashboard**: A responsive, dark-mode React application that renders real-time counts, heatmaps, purchase funnels, and alert notifications.
+### Container topology (`docker compose up`)
+
+| Container | Role | Port |
+|-----------|------|------|
+| `store_intel_db` | PostgreSQL 15 | 5432 |
+| `store_intel_redis` | Redis 7 | 6379 |
+| `store_intel_api` | Express API + WebSocket | 3000 |
+| `store_intel_pipeline` | Python CV + Simulation | — |
+| `store_intel_dashboard` | Nginx → Vite SPA | 80 |
 
 ---
 
-## 2. Event Schema
+## 2. Event Schema (Official Purplle JSONL Format)
 
-A consistent, structured event schema is used across the system:
+The pipeline emits events in the official Purplle JSONL schema. Three event families are supported:
 
+### 2a. Entry / Exit  (CAM at store gate)
 ```json
 {
-  "event_id": "evt_482910",
-  "timestamp": "2026-04-10T12:00:00.000Z",
-  "camera_id": "CAM 1",
-  "event_type": "ENTRY",
-  "customer_id": "cust_101",
-  "group_id": "group_50",
-  "zone": "Skincare",
-  "brand": "Good Vibes",
-  "is_staff": false,
-  "payload": {
-    "dwell_seconds": 25,
-    "confidence": 0.89,
-    "appearance": {
-      "upper_color": "blue",
-      "lower_color": "black"
-    }
-  }
+  "event_type":      "entry",
+  "id_token":        "ID_60001",
+  "store_code":      "store_1076",
+  "camera_id":       "CAM 3 - entry",
+  "event_timestamp": "2026-03-08T18:10:05.120000",
+  "is_staff":        false,
+  "gender_pred":     "F",
+  "age_pred":        28,
+  "age_bucket":      "25-34",
+  "is_face_hidden":  false,
+  "group_id":        null,
+  "group_size":      null
 }
 ```
 
-### Event Lifecycle:
-- `ENTRY` / `EXIT`: Generated by CAM 1 tracking entries and exits.
-- `ZONE_ENTRY` / `ZONE_EXIT`: Fired when a customer enters/leaves a brand shelf zone (CAM 2, 3, 5).
-- `INTERACTION`: Fired when a customer moves their hands near a shelf, indicating browsing or picking up.
-- `CHECKOUT_START` / `CHECKOUT_COMPLETE`: Tracks queues and transactions at the Cash Counter (CAM 4).
+### 2b. Zone Entry / Exit  (shelf-area cameras)
+```json
+{
+  "event_type":      "zone_entered",
+  "track_id":        60101,
+  "store_id":        "ST1076",
+  "camera_id":       "CAM 2 - zone",
+  "zone_id":         "PURPLLE_ST1076_Z01",
+  "zone_name":       "Makeup",
+  "zone_type":       "SHELF",
+  "is_revenue_zone": "Yes",
+  "event_time":      "2026-03-08T18:10:45.280000",
+  "zone_hotspot_x":  412.6,
+  "zone_hotspot_y":  238.4,
+  "gender":          "F",
+  "age":             28,
+  "age_bucket":      "25-34"
+}
+```
+
+### 2c. Queue Events  (billing counter camera)
+```json
+{
+  "queue_event_id":        "uuid-v4",
+  "event_type":            "queue_completed",
+  "track_id":              60102,
+  "store_id":              "ST1076",
+  "camera_id":             "CAM 5 - billing",
+  "zone_id":               "PURPLLE_ST1076_Z_BILLING_01",
+  "zone_name":             "Billing Counter Queue",
+  "zone_type":             "BILLING",
+  "is_revenue_zone":       "Yes",
+  "queue_join_ts":         "2026-03-08T18:13:05.080000",
+  "queue_served_ts":       "2026-03-08T18:13:13.240000",
+  "queue_exit_ts":         "2026-03-08T18:15:31.840000",
+  "wait_seconds":          8,
+  "queue_position_at_join": 2,
+  "abandoned":             false,
+  "zone_hotspot_x":        602.8,
+  "zone_hotspot_y":        183.4,
+  "gender":                "M",
+  "age":                   31,
+  "age_bucket":            "25-34"
+}
+```
+
+The API's `/api/ingest` endpoint normalises all three schemas into the internal DB representation automatically.
 
 ---
 
-## 3. Database Schema
+## 3. Dynamic Camera Classifier
 
-### Table: `events`
-Tracks all raw events fired by the pipeline.
-- `id` (UUID, Primary Key)
-- `timestamp` (TIMESTAMPTZ)
-- `camera_id` (VARCHAR)
-- `event_type` (VARCHAR)
-- `customer_id` (VARCHAR)
-- `group_id` (VARCHAR, Nullable)
-- `zone` (VARCHAR, Nullable)
-- `brand` (VARCHAR, Nullable)
-- `is_staff` (BOOLEAN)
-- `raw_payload` (JSONB)
+The `classify_camera(video_name)` function in `tracker.py` handles arbitrary naming conventions used across different stores, using ranked keyword matching:
 
-### Table: `sessions`
-Aggregates customer session durations and re-entries.
-- `customer_id` (VARCHAR, Primary Key)
-- `start_time` (TIMESTAMPTZ)
-- `end_time` (TIMESTAMPTZ, Nullable)
-- `is_staff` (BOOLEAN)
-- `re_entries` (INTEGER)
-- `group_id` (VARCHAR, Nullable)
+| Priority | Keywords matched (case-insensitive) | Assigned type |
+|----------|-------------------------------------|---------------|
+| 1 | `entry`, `entrance`, `door`, `gate` | `entry_exit` |
+| 2 | `billing`, `checkout`, `cash`, `payment`, `queue`, `counter` | `checkout` |
+| 3 | `makeup`, `cosmetic`, `lipstick` | `zone → Makeup` |
+| 4 | `skincare`, `skin` | `zone → Skincare` |
+| 5 | `hair` | `zone → Haircare` |
+| 6 | Legacy: `CAM 1`–`CAM 5` pattern | mapped to type by number |
+| 7 | Default fallback | `zone → Skincare` |
 
-### Table: `anomalies`
-Records detected store anomalies and alerts.
-- `id` (SERIAL, Primary Key)
-- `timestamp` (TIMESTAMPTZ)
-- `type` (VARCHAR)
-- `description` (TEXT)
-- `severity` (VARCHAR)
-- `customer_id` (VARCHAR, Nullable)
-
-### Table: `brand_dwell`
-Stores total dwell time (in seconds) per brand shelf visit.
-- `id` (SERIAL, Primary Key)
-- `customer_id` (VARCHAR)
-- `brand` (VARCHAR)
-- `dwell_seconds` (INTEGER)
-- `timestamp` (TIMESTAMPTZ)
+Examples:
+- `CAM 3 - entry.mp4` → `entry_exit`
+- `CAM 5 - billing.mp4` → `checkout`
+- `billing_area.mp4` → `checkout`
+- `entry 1.mp4` → `entry_exit`
+- `entry 2.mp4` → `entry_exit`
+- `zone.mp4` → `zone → Skincare`
+- `CAM 2 - zone.mp4` → `zone → Makeup`
 
 ---
 
-## 4. Edge Case Handling
+## 4. Database Schema
 
-1. **Staff Movement Filtering**: In-store staff perform frequent, repetitive movements between brand zones without purchasing. The pipeline detects staff using uniform color identification (purple shirts HSV hue threshold check on the upper torso area) inside `StoreTracker`. Identified staff are labeled with `is_staff = true` in events and excluded from sales conversion funnel calculations.
-2. **Re-Entry Merger**: Customers leaving the store temporarily and entering again are merged using body color histograms (Euclidean comparison of Hue bins). If matched with a customer who exited in the last 5 minutes (300 seconds), their tracks are linked to their original `customer_id`, preventing double counting of footfall.
-3. **Group Entry Association**: Multiple entries crossing the entry threshold (CAM 1) within 1.5 seconds are grouped with a shared `group_id`.
-4. **Occlusion Re-linking**: An IoU overlap matcher links lost tracks to newly detected boxes if they reappear in adjacent coordinates within 3 frames (3 seconds of video time under 30-frame skipping), maintaining trajectory continuity.
-5. **Gateway Routing Resilience**: Nginx is configured with a case-insensitive match directive for the metrics routes (`/metrics`, `/Metrics`) to route them directly to the API, preventing 404 or index file routing issues during automated gate testing.
+### `events`
+Stores all raw events from the pipeline.
+- `id` UUID PK · `timestamp` TIMESTAMPTZ · `camera_id` · `event_type`
+- `customer_id` · `group_id` · `zone` · `brand` · `is_staff` · `raw_payload` JSONB
+
+### `sessions`
+One row per unique customer visit.
+- `customer_id` PK · `start_time` · `end_time` · `is_staff` · `re_entries` · `group_id`
+
+### `anomalies`
+Real-time alerts from rule-based engine.
+- `id` SERIAL PK · `timestamp` · `type` · `description` · `severity` · `customer_id`
+
+### `brand_dwell`
+Aggregated shelf-dwell time per brand for Dwell-Revenue Index calculation.
+- `id` SERIAL PK · `customer_id` · `brand` · `dwell_seconds` · `timestamp`
+
+---
+
+## 5. API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/ingest` | Receive events from pipeline (Redis fallback) |
+| `GET` | `/api/metrics` | Footfall, active customers, dwell, GMV, conversion rate |
+| `GET` | `/api/funnel` | 5-step customer conversion funnel |
+| `GET` | `/api/anomaly` | Last 50 anomalies |
+| `GET` | `/api/sales` | Brand dwell-to-revenue correlation + planogram analysis |
+| `GET` | `/Metrics` | Alias for `/api/metrics` (case-insensitive, port 80 + 3000) |
+
+---
+
+## 6. Anomaly Detection Rules
+
+The API implements three real-time heuristics:
+1. **Loitering** — Customer in Cash Counter zone > 3 minutes without checkout
+2. **Unauthorized Access** — Customer enters a `Restricted Area` zone
+3. **Queue Congestion** — Billing queue dwell > 5 minutes (`queue_abandoned` with `wait_seconds > 300`)
+
+---
+
+## 7. Dual-Mode Execution
+
+**CV Mode**: When CCTV footage MP4 files are mounted in `/app/cctv_footage`, the pipeline:
+1. Classifies each video dynamically via `classify_camera()`
+2. Runs YOLOv8-nano person detection at 1 fps
+3. Uses IoU-based greedy tracking across frames
+4. Emits official schema events
+
+**Simulation Mode**: When no footage is found, generates a correlated, high-fidelity event stream using the `transactions.csv` dataset to drive realistic customer paths (entry → zone browse → billing queue → exit).
+
+---
+
+## 8. POS Data Integration
+
+The system uses the detailed Brigade Road Bangalore POS dataset (`Brigade_Bangalore_10_April_26.csv`) which provides:
+- Real GMV and NMV per line item
+- Actual salesperson names (kasthuri v, Zufishan Khazra, etc.)
+- Brand-level revenue breakdown across 20+ brands
+- Sub-category performance metrics
+
+The `/api/sales` endpoint correlates this data with CV-detected dwell times to compute **Dwell-Revenue Index (₹/hr)** per brand — a key planogram optimisation signal.
