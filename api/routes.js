@@ -174,8 +174,9 @@ const getMetrics = async (req, res) => {
     const avgDwellSeconds = parseFloat(dwellRes.rows[0].avg_dwell || '0');
     const avgDwellMinutes = parseFloat((avgDwellSeconds / 60).toFixed(2));
 
-    // Conversion rate
-    const conversionRate = footfall > 0 ? parseFloat(((salesSummary.totalOrders / footfall) * 100).toFixed(2)) : 0;
+    // Conversion rate — capped at 100% (POS orders may exceed CV-detected sessions due to timing)
+    const rawConversion = footfall > 0 ? (salesSummary.totalOrders / footfall) * 100 : 0;
+    const conversionRate = parseFloat(Math.min(100, rawConversion).toFixed(2));
 
     res.json({
       footfall,
@@ -212,36 +213,54 @@ const getFunnel = async (req, res) => {
     let shelfVisitors = parseInt(shelfRes.rows[0].count || '0', 10);
     shelfVisitors = Math.min(shelfVisitors, entered);
 
-    // Step 3: Product Engaged (any customer with an INTERACTION event and has an entry session)
-    const interactionRes = await db.query(`
-      SELECT COUNT(DISTINCT customer_id) as count 
-      FROM events 
-      WHERE event_type = 'INTERACTION' AND is_staff = FALSE
-        AND customer_id IN (SELECT customer_id FROM sessions WHERE is_staff = FALSE)
+    // Step 3: Product Engaged — customers who dwelled at a brand shelf (brand_dwell records)
+    // brand_dwell is populated on every ZONE_EXIT event, making this a reliable engagement signal
+    const engagedRes = await db.query(`
+      SELECT COUNT(DISTINCT customer_id) as count
+      FROM brand_dwell
+      WHERE customer_id IN (SELECT customer_id FROM sessions WHERE is_staff = FALSE)
     `);
-    let engaged = parseInt(interactionRes.rows[0].count || '0', 10);
+    let engaged = parseInt(engagedRes.rows[0].count || '0', 10);
     engaged = Math.min(engaged, shelfVisitors);
 
-    // Step 4: Checkout Start (customer entered checkout counter zone and has an entry session)
+    // Step 4: Initiated Checkout — customers who entered billing zone (CHECKOUT_COMPLETE or CHECKOUT_ABANDONED)
     const checkoutRes = await db.query(`
-      SELECT COUNT(DISTINCT customer_id) as count 
-      FROM events 
-      WHERE event_type = 'CHECKOUT_START' AND is_staff = FALSE
+      SELECT COUNT(DISTINCT customer_id) as count
+      FROM events
+      WHERE event_type IN ('CHECKOUT_COMPLETE', 'CHECKOUT_ABANDONED') AND is_staff = FALSE
         AND customer_id IN (SELECT customer_id FROM sessions WHERE is_staff = FALSE)
     `);
     let checkoutStarted = parseInt(checkoutRes.rows[0].count || '0', 10);
-    checkoutStarted = Math.min(checkoutStarted, engaged);
+    // If no checkout events yet (pipeline still processing), fall back to zone-based proxy
+    if (checkoutStarted === 0) {
+      const zoneCheckoutRes = await db.query(`
+        SELECT COUNT(DISTINCT customer_id) as count
+        FROM events
+        WHERE zone = 'Cash Counter' AND event_type = 'ZONE_ENTRY' AND is_staff = FALSE
+          AND customer_id IN (SELECT customer_id FROM sessions WHERE is_staff = FALSE)
+      `);
+      checkoutStarted = parseInt(zoneCheckoutRes.rows[0].count || '0', 10);
+    }
+    checkoutStarted = Math.min(checkoutStarted, engaged > 0 ? engaged : shelfVisitors);
 
-    // Step 5: Completed Transaction
-    let purchased = salesSummary.totalOrders;
+    // Step 5: Completed Purchase — CHECKOUT_COMPLETE events (not abandoned)
+    const purchasedRes = await db.query(`
+      SELECT COUNT(DISTINCT customer_id) as count
+      FROM events
+      WHERE event_type = 'CHECKOUT_COMPLETE' AND is_staff = FALSE
+        AND customer_id IN (SELECT customer_id FROM sessions WHERE is_staff = FALSE)
+    `);
+    let purchased = parseInt(purchasedRes.rows[0].count || '0', 10);
+    // Fall back to POS order count if CV checkout events not yet generated
+    if (purchased === 0) purchased = Math.min(salesSummary.totalOrders, checkoutStarted);
     purchased = Math.min(purchased, checkoutStarted);
 
     res.json([
-      { step: 'Entered Store', count: entered, percentage: 100 },
-      { step: 'Visited Shelves', count: shelfVisitors, percentage: entered > 0 ? parseFloat(((shelfVisitors / entered) * 100).toFixed(1)) : 0 },
-      { step: 'Engaged Products', count: engaged, percentage: shelfVisitors > 0 ? parseFloat(((engaged / shelfVisitors) * 100).toFixed(1)) : 0 },
-      { step: 'Initiated Checkout', count: checkoutStarted, percentage: engaged > 0 ? parseFloat(((checkoutStarted / engaged) * 100).toFixed(1)) : 0 },
-      { step: 'Purchased', count: purchased, percentage: checkoutStarted > 0 ? parseFloat(((purchased / checkoutStarted) * 100).toFixed(1)) : 0 }
+      { step: 'Entered Store',      count: entered,        percentage: 100 },
+      { step: 'Visited Shelves',    count: shelfVisitors,  percentage: entered > 0         ? parseFloat(((shelfVisitors / entered) * 100).toFixed(1))        : 0 },
+      { step: 'Engaged Products',   count: engaged,        percentage: shelfVisitors > 0  ? parseFloat(((engaged / shelfVisitors) * 100).toFixed(1))        : 0 },
+      { step: 'Initiated Checkout', count: checkoutStarted,percentage: engaged > 0        ? parseFloat(((checkoutStarted / engaged) * 100).toFixed(1))     : 0 },
+      { step: 'Purchased',          count: purchased,      percentage: checkoutStarted > 0 ? parseFloat(((purchased / checkoutStarted) * 100).toFixed(1)) : 0 }
     ]);
   } catch (err) {
     console.error("Error executing /funnel query:", err);
@@ -359,5 +378,40 @@ const getSales = async (req, res) => {
 };
 router.get('/sales', getSales);
 router.get('/Sales', getSales);
+
+// Route: GET /status — system health summary for observability
+const getStatus = async (req, res) => {
+  try {
+    const [eventsRes, sessionsRes, anomaliesRes, brandDwellRes] = await Promise.all([
+      db.query('SELECT COUNT(*) as total, MAX(timestamp) as latest FROM events'),
+      db.query('SELECT COUNT(*) as total, COUNT(end_time) as completed FROM sessions WHERE is_staff = FALSE'),
+      db.query('SELECT COUNT(*) as total, MAX(timestamp) as latest FROM anomalies'),
+      db.query('SELECT COUNT(DISTINCT brand) as brands FROM brand_dwell'),
+    ]);
+    res.json({
+      status: 'operational',
+      timestamp: new Date().toISOString(),
+      events: {
+        total: parseInt(eventsRes.rows[0].total, 10),
+        latest: eventsRes.rows[0].latest,
+      },
+      sessions: {
+        total: parseInt(sessionsRes.rows[0].total, 10),
+        completed: parseInt(sessionsRes.rows[0].completed, 10),
+      },
+      anomalies: {
+        total: parseInt(anomaliesRes.rows[0].total, 10),
+        latest: anomaliesRes.rows[0].latest,
+      },
+      brandsTracked: parseInt(brandDwellRes.rows[0].brands, 10),
+      posOrders: salesSummary.totalOrders,
+      posGMV: parseFloat(salesSummary.totalGMV.toFixed(2)),
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'degraded', error: err.message });
+  }
+};
+router.get('/status', getStatus);
+router.get('/Status', getStatus);
 
 module.exports = router;

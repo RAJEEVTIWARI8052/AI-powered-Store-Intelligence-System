@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { 
   Users, ShoppingBag, Clock, TrendingUp, DollarSign, 
   AlertTriangle, ShieldAlert, Zap, MapPin, RefreshCw,
-  Camera, ShoppingCart, HelpCircle
+  Camera, ShoppingCart, HelpCircle, Upload, X, CheckCircle
 } from 'lucide-react';
 
 const API_BASE = '/api';
@@ -39,7 +39,35 @@ export default function App() {
   const [liveEvents, setLiveEvents] = useState([]);
   const [activeTab, setActiveTab] = useState('events'); // events or anomalies
   const [connected, setConnected] = useState(false);
+  const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
+  const [uploadState, setUploadState] = useState({ status: 'idle', message: '' }); // idle, uploading, success, error
+  const fileInputRef = useRef(null);
   const wsRef = useRef(null);
+
+  const handleUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    
+    setUploadState({ status: 'uploading', message: 'Uploading video (this may take a moment)...' });
+    const formData = new FormData();
+    formData.append('video', file);
+    
+    try {
+      const res = await fetch('/api/upload-video', {
+        method: 'POST',
+        body: formData
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setUploadState({ status: 'success', message: 'Video uploaded! The pipeline is now processing it.' });
+        setTimeout(() => { setIsUploadModalOpen(false); setUploadState({ status: 'idle', message: '' }); }, 3000);
+      } else {
+        setUploadState({ status: 'error', message: data.error || 'Upload failed' });
+      }
+    } catch (err) {
+      setUploadState({ status: 'error', message: 'Network error during upload' });
+    }
+  };
 
   // Fetch API metrics
   const fetchAllData = async () => {
@@ -70,9 +98,9 @@ export default function App() {
     // Refresh API data every 5 seconds
     const interval = setInterval(fetchAllData, 5000);
 
-    // Initialize WebSocket — connect directly to API port 3000 (WS server lives there, not on nginx port 80)
+    // Initialize WebSocket — connect through nginx /ws proxy (same port as dashboard)
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.hostname}:3000`;
+    const wsUrl = `${protocol}//${window.location.host}/ws`;
     
     const connectWS = () => {
       console.log(`Connecting to WebSocket at: ${wsUrl}`);
@@ -135,11 +163,74 @@ export default function App() {
             <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: connected ? 'var(--green)' : 'var(--red)', display: 'inline-block' }}></span>
             <span style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>{connected ? 'LIVE EVENT STREAM CONNECTED' : 'OFFLINE - RECONNECTING'}</span>
           </div>
+          <button onClick={() => setIsUploadModalOpen(true)} className="panel" style={{ padding: '8px 16px', borderRadius: '20px', display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', background: 'rgba(139, 92, 246, 0.15)', color: 'var(--primary)', border: '1px solid rgba(139, 92, 246, 0.3)' }}>
+            <Upload size={16} />
+            <span style={{ fontSize: '13px', fontWeight: 'bold' }}>Upload Video</span>
+          </button>
           <button onClick={fetchAllData} className="panel" style={{ padding: '8px 12px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
             <RefreshCw size={16} />
           </button>
         </div>
       </header>
+
+      {/* Upload Modal */}
+      {isUploadModalOpen && (
+        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.8)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
+          <div style={{ background: 'var(--panel-bg)', border: '1px solid var(--panel-border)', borderRadius: '12px', padding: '30px', width: '400px', position: 'relative', boxShadow: '0 20px 40px rgba(0,0,0,0.5)' }}>
+            <button onClick={() => setIsUploadModalOpen(false)} style={{ position: 'absolute', top: '15px', right: '15px', background: 'transparent', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer' }}>
+              <X size={20} />
+            </button>
+            <h3 style={{ marginTop: 0, marginBottom: '20px', color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <Upload size={20} style={{ color: 'var(--primary)' }} /> Upload CCTV Footage
+            </h3>
+            
+            <p style={{ color: 'var(--text-secondary)', fontSize: '14px', marginBottom: '20px', lineHeight: '1.5' }}>
+              Upload an MP4 file to run through the YOLOv8 Computer Vision pipeline online. The simulation will pause while processing.
+            </p>
+
+            <div style={{ 
+              border: '2px dashed rgba(139, 92, 246, 0.3)', 
+              borderRadius: '8px', 
+              padding: '30px', 
+              textAlign: 'center',
+              background: 'rgba(0,0,0,0.2)',
+              cursor: uploadState.status === 'uploading' ? 'default' : 'pointer'
+            }} onClick={() => uploadState.status !== 'uploading' && fileInputRef.current.click()}>
+              <input type="file" accept="video/mp4" ref={fileInputRef} onChange={handleUpload} style={{ display: 'none' }} />
+              
+              {uploadState.status === 'idle' && (
+                <>
+                  <Camera size={32} style={{ color: 'var(--text-secondary)', margin: '0 auto 10px auto' }} />
+                  <p style={{ color: 'var(--primary)', fontWeight: 'bold', margin: 0 }}>Click to browse</p>
+                  <p style={{ color: 'var(--text-secondary)', fontSize: '12px', margin: '5px 0 0 0' }}>Maximum file size: 500MB</p>
+                </>
+              )}
+              
+              {uploadState.status === 'uploading' && (
+                <div style={{ color: 'var(--cyan)' }}>
+                  <RefreshCw size={32} className="animate-spin" style={{ margin: '0 auto 10px auto' }} />
+                  <p style={{ fontWeight: 'bold', margin: 0 }}>{uploadState.message}</p>
+                </div>
+              )}
+              
+              {uploadState.status === 'success' && (
+                <div style={{ color: 'var(--green)' }}>
+                  <CheckCircle size={32} style={{ margin: '0 auto 10px auto' }} />
+                  <p style={{ fontWeight: 'bold', margin: 0 }}>{uploadState.message}</p>
+                </div>
+              )}
+              
+              {uploadState.status === 'error' && (
+                <div style={{ color: 'var(--red)' }}>
+                  <AlertTriangle size={32} style={{ margin: '0 auto 10px auto' }} />
+                  <p style={{ fontWeight: 'bold', margin: 0 }}>{uploadState.message}</p>
+                  <p style={{ fontSize: '12px', marginTop: '5px', color: 'var(--text-secondary)' }}>Click to try again</p>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Metrics Row */}
       <section style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '20px', marginBottom: '35px' }}>
@@ -360,20 +451,52 @@ export default function App() {
                     <ShieldAlert size={30} style={{ color: 'var(--green)', marginBottom: '10px' }} />
                     <p>No anomalies detected. Operations normal.</p>
                   </div>
-                ) : (
-                  anomalies.map((anom, idx) => (
-                    <div key={idx} className="animate-slide-in" style={{ background: 'rgba(239, 68, 68, 0.04)', border: `1px solid ${anom.severity === 'HIGH' ? 'var(--red)' : 'var(--orange)'}`, padding: '12px', borderRadius: '8px', fontSize: '12px' }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
-                        <span style={{ fontWeight: 'bold', color: anom.severity === 'HIGH' ? 'var(--red)' : 'var(--orange)', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                          <AlertTriangle size={14} />
-                          {anom.type} ({anom.severity})
-                        </span>
-                        <span style={{ color: 'var(--text-secondary)' }}>{new Date(anom.timestamp).toLocaleTimeString()}</span>
+                ) : (() => {
+                  // Per-type config
+                  const typeCfg = {
+                    UNAUTHORIZED_ACCESS: { color: 'var(--red)',    bg: 'rgba(239,68,68,0.07)',   icon: '🚨', label: 'Unauthorized' },
+                    LOITERING:           { color: 'var(--orange)', bg: 'rgba(245,158,11,0.07)',  icon: '⏱️', label: 'Loitering'    },
+                    QUEUE_CONGESTION:    { color: 'var(--orange)', bg: 'rgba(245,158,11,0.07)',  icon: '👥', label: 'Queue Jam'    },
+                    HIGH_DWELL:          { color: 'var(--cyan)',   bg: 'rgba(6,182,212,0.07)',   icon: '👁️', label: 'High Dwell'   },
+                    CHECKOUT_ABANDONED:  { color: '#a78bfa',      bg: 'rgba(167,139,250,0.07)', icon: '🛒', label: 'Abandoned'    },
+                  };
+                  // Count by type for summary row
+                  const counts = anomalies.reduce((acc, a) => { acc[a.type] = (acc[a.type]||0)+1; return acc; }, {});
+                  return (
+                    <>
+                      {/* Summary badges */}
+                      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '12px' }}>
+                        {Object.entries(counts).map(([type, cnt]) => {
+                          const cfg = typeCfg[type] || { color: 'var(--text-secondary)', icon: '⚠️', label: type };
+                          return (
+                            <span key={type} style={{ background: 'rgba(255,255,255,0.05)', border: `1px solid ${cfg.color}`, color: cfg.color, borderRadius: '20px', padding: '3px 10px', fontSize: '11px', fontWeight: '600', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                              {cfg.icon} {cfg.label} <span style={{ background: cfg.color, color: '#000', borderRadius: '50%', width: '16px', height: '16px', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: '10px', fontWeight: '700' }}>{cnt}</span>
+                            </span>
+                          );
+                        })}
                       </div>
-                      <p style={{ color: 'var(--text-primary)', marginTop: '4px' }}>{anom.description}</p>
-                    </div>
-                  ))
-                )
+                      {/* Anomaly cards */}
+                      {anomalies.map((anom, idx) => {
+                        const cfg = typeCfg[anom.type] || { color: 'var(--orange)', bg: 'rgba(245,158,11,0.07)', icon: '⚠️' };
+                        const sevColor = anom.severity === 'HIGH' ? 'var(--red)' : anom.severity === 'MEDIUM' ? 'var(--orange)' : 'var(--cyan)';
+                        return (
+                          <div key={idx} className="animate-slide-in" style={{ background: cfg.bg, border: `1px solid ${cfg.color}`, padding: '12px', borderRadius: '8px', fontSize: '12px' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '6px' }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <span style={{ fontSize: '16px' }}>{cfg.icon}</span>
+                                <span style={{ fontWeight: 'bold', color: cfg.color, fontSize: '11px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{anom.type.replace(/_/g,' ')}</span>
+                                <span style={{ background: sevColor, color: '#000', borderRadius: '4px', padding: '1px 6px', fontSize: '9px', fontWeight: '700' }}>{anom.severity}</span>
+                              </div>
+                              <span style={{ color: 'var(--text-secondary)', fontSize: '11px', whiteSpace: 'nowrap' }}>{new Date(anom.timestamp).toLocaleTimeString()}</span>
+                            </div>
+                            <p style={{ color: 'var(--text-primary)', lineHeight: '1.5', margin: 0 }}>{anom.description}</p>
+                            {anom.customer_id && <p style={{ color: 'var(--text-secondary)', marginTop: '4px', fontSize: '10px' }}>ID: {anom.customer_id}</p>}
+                          </div>
+                        );
+                      })}
+                    </>
+                  );
+                })()
               )}
             </div>
           </div>

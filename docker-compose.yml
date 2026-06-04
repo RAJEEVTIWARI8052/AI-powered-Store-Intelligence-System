@@ -44,6 +44,8 @@ services:
       - "3000:3000"
     volumes:
       - ./data:/app/data
+      - ./uploads:/app/uploads
+    restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
@@ -58,6 +60,8 @@ services:
       - CCTV_DIR=/app/cctv_footage
     volumes:
       - ./CCTV Footage:/app/cctv_footage:ro
+      - ./uploads:/app/uploads
+    restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy

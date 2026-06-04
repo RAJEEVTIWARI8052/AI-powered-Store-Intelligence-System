@@ -1,0 +1,7 @@
+yolov8n.pt
+CCTV Footage/
+CCTV Footage*.zip
+Store*.zip
+extracted_images/
+node_modules/
+.git/

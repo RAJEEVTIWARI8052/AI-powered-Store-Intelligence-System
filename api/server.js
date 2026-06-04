@@ -6,6 +6,11 @@ const crypto  = require('crypto');
 const db      = require('./db');
 const routes  = require('./routes');
 const logger  = require('./logger');
+const multer  = require('multer');
+const fs      = require('fs');
+const path    = require('path');
+
+let redisPublisher = null;
 
 // ---------------------------------------------------------------------------
 // Prometheus metrics setup
@@ -71,6 +76,52 @@ app.use((req, res, next) => {
 
 app.use('/api', routes);
 app.use('/', routes); // Support root-level calls like /metrics and /Metrics
+
+// Configure multer for video upload
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const uploadDir = '/app/uploads';
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    // Keep original name but add timestamp to avoid collisions
+    const ext = path.extname(file.originalname);
+    const basename = path.basename(file.originalname, ext);
+    cb(null, `${basename}_${Date.now()}${ext}`);
+  }
+});
+const upload = multer({ 
+  storage,
+  limits: { fileSize: 500 * 1024 * 1024 } // 500MB limit
+});
+
+app.post('/api/upload-video', upload.single('video'), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No video file provided' });
+  }
+  
+  logger.info('Video uploaded successfully', { filename: req.file.filename, size: req.file.size });
+  
+  // Publish message to Redis to trigger pipeline
+  if (redisPublisher) {
+    redisPublisher.publish('process_video', JSON.stringify({
+      filename: req.file.filename,
+      filepath: req.file.path
+    })).catch(err => {
+      logger.error('Failed to publish process_video event', { error: err.message });
+    });
+  }
+  
+  res.json({ 
+    success: true, 
+    message: 'Video uploaded and processing triggered',
+    filename: req.file.filename
+  });
+});
+
 
 // Prometheus metrics endpoint
 app.get('/api/system/metrics', async (req, res) => {
@@ -262,45 +313,83 @@ async function processEvent(event) {
 
   // 4. Real-time Anomaly Detection Rules
   if (!isStaff) {
-    // Rule A: Loitering at Cash Counter without checkout
-    if (type === 'ZONE_EXIT' && zone === 'Cash Counter' && payload.dwell_seconds > 180) {
-      await logAnomaly(
-        timestamp, 
-        'LOITERING', 
-        `Customer ${customerId} loitered at the Cash Counter for ${Math.round(payload.dwell_seconds / 60)} minutes without checking out.`, 
-        'LOW', 
-        customerId
+    // Rule A: Loitering at Cash Counter without completing checkout
+    // Threshold: 45s — realistic for a simulated tick cycle
+    if (type === 'ZONE_EXIT' && zone === 'Cash Counter' && payload.dwell_seconds > 45) {
+      const alreadyCheckedOut = await db.query(
+        `SELECT COUNT(*) as c FROM events WHERE customer_id=$1 AND event_type IN ('CHECKOUT_COMPLETE','CHECKOUT_ABANDONED') AND timestamp > NOW() - INTERVAL '10 minutes'`,
+        [customerId]
       );
+      if (parseInt(alreadyCheckedOut.rows[0].c, 10) === 0) {
+        await logAnomaly(
+          timestamp,
+          'LOITERING',
+          `Customer ${customerId} loitered at the Cash Counter for ${payload.dwell_seconds}s without completing checkout — possible confusion or abandonment.`,
+          'MEDIUM',
+          customerId
+        );
+      }
     }
 
     // Rule B: Unauthorized Zone Access (Restricted Area)
     if (type === 'ZONE_ENTRY' && zone === 'Restricted Area') {
       await logAnomaly(
-        timestamp, 
-        'UNAUTHORIZED_ACCESS', 
-        `Customer ${customerId} entered a restricted employee-only zone.`, 
-        'HIGH', 
+        timestamp,
+        'UNAUTHORIZED_ACCESS',
+        `SECURITY ALERT: Customer ${customerId} breached the restricted employee-only zone. Immediate staff response required.`,
+        'HIGH',
         customerId
       );
     }
 
-    // Rule C: Queue Congestion Warning
-    if (type === 'ZONE_ENTRY' && zone === 'Cash Counter') {
+    // Rule C: Queue Congestion Warning — 3+ customers at Cash Counter in 10 minutes
+    if (type === 'ZONE_ENTRY' && (zone === 'Cash Counter' || zone === 'Billing Counter Queue')) {
       const queueRes = await db.query(`
-        SELECT COUNT(DISTINCT customer_id) as count 
-        FROM events 
-        WHERE zone = 'Cash Counter' AND event_type = 'ZONE_ENTRY' 
-          AND timestamp > NOW() - INTERVAL '5 minutes'
+        SELECT COUNT(DISTINCT customer_id) as count
+        FROM events
+        WHERE zone IN ('Cash Counter','Billing Counter Queue')
+          AND event_type IN ('ZONE_ENTRY','CHECKOUT_COMPLETE','CHECKOUT_ABANDONED')
+          AND timestamp > NOW() - INTERVAL '10 minutes'
+          AND is_staff = FALSE
       `);
       const queueCount = parseInt(queueRes.rows[0].count || '0', 10);
-      if (queueCount >= 5) {
-        await logAnomaly(
-          timestamp, 
-          'QUEUE_CONGESTION', 
-          `High queue congestion detected at Cash Counter. ${queueCount} customers waiting.`, 
-          'MEDIUM'
+      if (queueCount >= 3) {
+        // Deduplicate — only alert once per 2-minute window
+        const recentCongestion = await db.query(
+          `SELECT COUNT(*) as c FROM anomalies WHERE type='QUEUE_CONGESTION' AND timestamp > NOW() - INTERVAL '2 minutes'`
         );
+        if (parseInt(recentCongestion.rows[0].c, 10) === 0) {
+          await logAnomaly(
+            timestamp,
+            'QUEUE_CONGESTION',
+            `Queue congestion at billing counter — ${queueCount} customers in the last 10 minutes. Consider opening an additional checkout lane.`,
+            'MEDIUM'
+          );
+        }
       }
+    }
+
+    // Rule D: High dwell at shelf zone — potential shoplifting or deep product engagement
+    if (type === 'ZONE_EXIT' && zone !== 'Cash Counter' && zone !== 'Restricted Area' && payload.dwell_seconds > 90) {
+      // Only flag if no purchase follows (cannot know yet, so flag as INFO for staff awareness)
+      await logAnomaly(
+        timestamp,
+        'HIGH_DWELL',
+        `Customer ${customerId} spent ${payload.dwell_seconds}s at the ${zone} shelf — high engagement detected. Staff may want to assist.`,
+        'LOW',
+        customerId
+      );
+    }
+
+    // Rule E: Checkout abandonment — customer left queue without buying
+    if (type === 'CHECKOUT_ABANDONED') {
+      await logAnomaly(
+        timestamp,
+        'CHECKOUT_ABANDONED',
+        `Customer ${customerId} abandoned the checkout queue after ${payload.dwell_seconds || '?'}s wait. Review queue staffing or pricing friction.`,
+        'MEDIUM',
+        customerId
+      );
     }
   }
 
@@ -343,6 +432,7 @@ async function startRedisSubscription() {
   client.on('error', (err) => logger.error('Redis Client Error', { error: err.message }));
 
   await client.connect();
+  redisPublisher = client;
   logger.info('Connected to Redis successfully');
 
   const subscriber = client.duplicate();

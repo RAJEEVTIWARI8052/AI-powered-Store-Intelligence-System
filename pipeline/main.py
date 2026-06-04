@@ -22,6 +22,7 @@ import random
 import requests
 import datetime
 import csv
+import threading
 from tracker import StoreTracker, classify_camera, STORE_CODE, STORE_ID, _pick_demographics
 
 # ---------------------------------------------------------------------------
@@ -82,21 +83,42 @@ def publish_event(event: dict):
 # ---------------------------------------------------------------------------
 # CV Pipeline (runs when video files are mounted)
 # ---------------------------------------------------------------------------
-def run_cv_pipeline(cctv_path: str):
-    """Process all MP4 files found in cctv_path using YOLOv8 + StoreTracker."""
-    try:
-        import cv2
-        from ultralytics import YOLO
-    except ImportError as e:
-        raise RuntimeError(f"Missing CV dependencies: {e}")
+# Global model and tracker to avoid reloading
+_yolo_model = None
+_tracker = None
+cv_processing_active = False
 
-    print(f"\n📦 Loading YOLOv8n model…")
-    model   = YOLO("yolov8n.pt")
-    tracker = StoreTracker()
+def init_cv():
+    global _yolo_model, _tracker
+    if _yolo_model is None:
+        try:
+            from ultralytics import YOLO
+            print(f"\n📦 Loading YOLOv8n model…")
+            _yolo_model = YOLO("yolov8n.pt")
+            _tracker = StoreTracker()
+        except ImportError as e:
+            raise RuntimeError(f"Missing CV dependencies: {e}")
 
-    video_files = sorted(
-        f for f in os.listdir(cctv_path) if f.lower().endswith(".mp4")
-    )
+# ---------------------------------------------------------------------------
+# CV Pipeline (runs when video files are mounted or uploaded)
+# ---------------------------------------------------------------------------
+def run_cv_pipeline(cctv_path: str = None, single_file: str = None):
+    """Process all MP4 files found in cctv_path or a specific single_file using YOLOv8."""
+    global cv_processing_active
+    cv_processing_active = True
+    
+    init_cv()
+    import cv2
+
+    video_files = []
+    if single_file:
+        video_files = [single_file]
+        cctv_path = os.path.dirname(single_file)
+        video_files = [os.path.basename(single_file)]
+    elif cctv_path:
+        video_files = sorted(
+            f for f in os.listdir(cctv_path) if f.lower().endswith(".mp4")
+        )
     print(f"🎥 Found {len(video_files)} video file(s): {video_files}\n")
 
     for video in video_files:
@@ -132,7 +154,7 @@ def run_cv_pipeline(cctv_path: str):
                 continue
 
             # Detect persons (class 0 = person in COCO)
-            results    = model(frame, verbose=False, classes=[0])
+            results    = _yolo_model(frame, verbose=False, classes=[0])
             detections = []
             for box in results[0].boxes:
                 if float(box.conf[0]) >= 0.35:
@@ -141,7 +163,7 @@ def run_cv_pipeline(cctv_path: str):
 
             sim_ts = start_time + datetime.timedelta(seconds=int(frame_idx / fps))
 
-            events = tracker.update(detections, frame, camera_id, frame_idx, sim_ts, cam_info)
+            events = _tracker.update(detections, frame, camera_id, frame_idx, sim_ts, cam_info)
             for evt in events:
                 evt.setdefault("event_id",  f"evt_{uuid.uuid4().hex[:8]}")
                 evt.setdefault("timestamp", sim_ts.isoformat())
@@ -156,7 +178,7 @@ def run_cv_pipeline(cctv_path: str):
 
         # End of video — flush remaining tracks
         sim_end = start_time + datetime.timedelta(seconds=int(frame_idx / fps))
-        for evt in tracker.clear_active_tracks(camera_id, sim_end, cam_info):
+        for evt in _tracker.clear_active_tracks(camera_id, sim_end, cam_info):
             evt.setdefault("event_id",  f"evt_{uuid.uuid4().hex[:8]}")
             evt.setdefault("timestamp", sim_end.isoformat())
             publish_event(evt)
@@ -164,8 +186,31 @@ def run_cv_pipeline(cctv_path: str):
         cap.release()
         print(f"  ✅ Done: {video}")
 
+    cv_processing_active = False
     print("\n🎉 CV pipeline completed for all videos.")
 
+
+# ---------------------------------------------------------------------------
+# Redis Listener for Uploaded Videos
+# ---------------------------------------------------------------------------
+def redis_listener():
+    if not r_client:
+        return
+    pubsub = r_client.pubsub()
+    pubsub.subscribe('process_video')
+    print("🎧 Listening for uploaded videos on Redis channel 'process_video'...")
+    
+    for message in pubsub.listen():
+        if message['type'] == 'message':
+            try:
+                data = json.loads(message['data'])
+                filepath = data.get('filepath')
+                if filepath and os.path.exists(filepath):
+                    print(f"📥 Received video upload trigger: {filepath}")
+                    # Run in a separate thread to not block listener
+                    threading.Thread(target=run_cv_pipeline, kwargs={'single_file': filepath}, daemon=True).start()
+            except Exception as e:
+                print(f"⚠️ Error processing uploaded video trigger: {e}")
 
 # ---------------------------------------------------------------------------
 # Simulation Pipeline (runs when no video files are mounted)
@@ -227,11 +272,20 @@ def run_simulation_pipeline():
     print("🔄 Starting High-Fidelity Simulation Mode…")
     transactions = load_transactions()
 
+    print("============================================================")
+    print("  SIMULATION PIPELINE STARTED  ")
+    print("============================================================")
+
     active     = {}          # cust_id → state dict
     counter    = 60000       # numeric ID seed
     track_ctr  = 10000       # track_id seed
 
     while True:
+        # Pause simulation if CV processing is active
+        if cv_processing_active:
+            time.sleep(5)
+            continue
+            
         now = datetime.datetime.now()
 
         # ── Spawn new customers ──────────────────────────────────────────
@@ -452,16 +506,20 @@ def main():
     else:
         mp4_files = []
 
+    # Start redis listener thread for uploads
+    threading.Thread(target=redis_listener, daemon=True).start()
+
     if mp4_files:
         print(f"🎥 CCTV footage detected ({len(mp4_files)} files). Running CV pipeline…")
         try:
-            run_cv_pipeline(CCTV_DIR)
+            run_cv_pipeline(cctv_path=CCTV_DIR)
         except Exception as e:
             print(f"⚠️  CV pipeline error: {e}. Falling back to simulation…")
-            run_simulation_pipeline()
+        print("🔄 CV pipeline complete. Switching to simulation mode to keep live feed active…")
     else:
         print("📡 No CCTV files found. Running High-Fidelity Simulation…")
-        run_simulation_pipeline()
+
+    run_simulation_pipeline()
 
 
 if __name__ == "__main__":

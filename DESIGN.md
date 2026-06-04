@@ -178,13 +178,16 @@ Aggregated shelf-dwell time per brand for Dwell-Revenue Index calculation.
 ## 5. API Endpoints
 
 | Method | Path | Description |
-|--------|------|-------------|
+|--------|------|--------------|
 | `POST` | `/api/ingest` | Receive events from pipeline (Redis fallback) |
-| `GET` | `/api/metrics` | Footfall, active customers, dwell, GMV, conversion rate |
-| `GET` | `/api/funnel` | 5-step customer conversion funnel |
-| `GET` | `/api/anomaly` | Last 50 anomalies |
-| `GET` | `/api/sales` | Brand dwell-to-revenue correlation + planogram analysis |
-| `GET` | `/Metrics` | Alias for `/api/metrics` (case-insensitive, port 80 + 3000) |
+| `GET`  | `/api/metrics` | Footfall, active customers, dwell, GMV, conversion rate (capped ≤100%) |
+| `GET`  | `/api/funnel` | 5-step customer conversion funnel (brand_dwell-backed) |
+| `GET`  | `/api/anomaly` | Last 50 anomalies with type, severity, description |
+| `GET`  | `/api/sales` | Brand dwell-to-revenue correlation + planogram analysis |
+| `GET`  | `/api/status` | System health summary (events, sessions, anomalies, brands) |
+| `GET`  | `/api/health` | DB connectivity probe |
+| `GET`  | `/Metrics` | Alias for `/api/metrics` (case-insensitive — all routes dual-registered) |
+| `WS`   | `/ws` | WebSocket stream — real-time event and anomaly broadcast via nginx proxy |
 
 ---
 
@@ -218,3 +221,53 @@ The system uses the detailed Brigade Road Bangalore POS dataset (`Brigade_Bangal
 - Sub-category performance metrics
 
 The `/api/sales` endpoint correlates this data with CV-detected dwell times to compute **Dwell-Revenue Index (₹/hr)** per brand — a key planogram optimisation signal.
+
+---
+
+## 9. Real-Time WebSocket Architecture
+
+```
+Pipeline (Python)
+    │
+    │  redis.publish("store_events", json.dumps(event))
+    ▼
+Redis Pub/Sub  ──────────────────────────────────────┐
+    │                                                 │
+    ▼                                                 │
+API Server (Node.js)                                  │
+    │  subscriber.subscribe("store_events")            │
+    │  → processEvent(event)                          │
+    │  → broadcast(event) to all WS clients           │
+    │                                                 │
+    ▼                                                 │
+WebSocket Server (ws on port 3000)                   │
+    │  wss.on("connection") → clients.add(ws)         │
+    │                                                 │
+    ▼                                                 │
+Nginx (/ws proxy_pass → api:3000)                    │
+    │  Upgrade: websocket headers forwarded            │
+    │  proxy_read_timeout 3600s                        │
+    ▼                                                 │
+Browser Dashboard (React)                            │
+    │  new WebSocket("ws://localhost/ws")              │
+    │  onmessage → update Live Feed / Anomaly Logs    │
+    └─────────────────────────────────────────────────┘
+```
+
+**Key design decisions:**
+- WebSocket server is co-located with the HTTP API (shared `http.Server`) to avoid an extra port.
+- Nginx proxies `/ws` with `Upgrade` and `Connection: upgrade` headers and a 3600-second read timeout to prevent idle disconnects.
+- The dashboard reconnects automatically every 3 seconds on disconnect.
+- Anomaly events (`ANOMALY_DETECTED` type) are routed to the Anomaly Logs tab; all other events go to the Live Detection Feed ticker.
+
+---
+
+## 10. Observability Stack
+
+| Layer | Implementation |
+|-------|---------------|
+| **Structured logging** | Winston JSON logs with level, timestamp, HTTP method, path, status, duration (ms) |
+| **Prometheus metrics** | `prom-client` — HTTP request counter, request latency histogram, events processed counter, anomaly counter |
+| **Health check** | `GET /api/health` — validates DB connectivity, returns ISO timestamp |
+| **System status** | `GET /api/status` — DB event count, session stats, anomaly count, brands tracked |
+| **Docker healthchecks** | PostgreSQL `pg_isready`, Redis `redis-cli ping` — both services must pass before dependent containers start |
