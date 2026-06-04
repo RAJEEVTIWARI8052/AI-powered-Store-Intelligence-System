@@ -271,3 +271,13 @@ Browser Dashboard (React)                            │
 | **Health check** | `GET /api/health` — validates DB connectivity, returns ISO timestamp |
 | **System status** | `GET /api/status` — DB event count, session stats, anomaly count, brands tracked |
 | **Docker healthchecks** | PostgreSQL `pg_isready`, Redis `redis-cli ping` — both services must pass before dependent containers start |
+
+---
+
+## 11. AI-Assisted Decisions
+
+Throughout the development of AURA, AI coding assistants (like Gemini and Copilot) were leveraged to accelerate engineering velocity and ensure robustness:
+1. **Schema Parsing and Normalization**: AI was used to draft the data normalizer in `routes.js` to dynamically handle both the official Purplle JSONL schema and internal legacy schemas without manual mapping.
+2. **PostgreSQL Aggregation Queries**: Complex SQL queries for funnel and session analytics, ensuring `COUNT(DISTINCT)` logic and `JSONB` indexing best practices, were optimized using AI suggestions to achieve <10ms p95 latency.
+3. **Pipeline Multiprocessing Optimization**: The decision to decouple the YOLOv8 tracker from the Node API via Redis pub/sub was brainstormed and validated through architectural prompts with an AI assistant.
+4. **React Dashboard Live Feed**: The WebSocket handling, auto-reconnection logic, and the UI component for the real-time event ticker in the Vite dashboard were bootstrapped using AI-generated boilerplate to save time on basic React state management.
